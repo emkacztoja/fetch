@@ -4,11 +4,15 @@ use std::process::Command;
 #[tauri::command]
 async fn chat_with_pet(prompt: String) -> Result<String, String> {
     if let Ok(key) = dotenvy::var("ANTHROPIC_API_KEY") {
+        eprintln!("[fetch] Using Anthropic API");
         chat_with_anthropic(&key, &prompt).await
     } else if let Ok(key) = dotenvy::var("OPENAI_API_KEY") {
+        eprintln!("[fetch] Using OpenAI API");
         chat_with_openai(&key, &prompt).await
     } else {
-        Err("No API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env".to_string())
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        eprintln!("[fetch] No API key found. CWD: {cwd}");
+        Err(format!("No API key found in {cwd}. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env"))
     }
 }
 
@@ -18,7 +22,7 @@ async fn chat_with_openai(api_key: &str, prompt: &str) -> Result<String, String>
     let client = reqwest::Client::new();
 
     let body = serde_json::json!({
-        "model": "gpt-5-nano",
+        "model": "gpt-5.4-nano",
         "messages": [
             {
                 "role": "system",
@@ -333,8 +337,14 @@ fn change_theme(theme: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load .env file
-    let _ = dotenvy::dotenv();
+    // Load .env from multiple possible locations (Tauri dev may run from src-tauri/)
+    if dotenvy::dotenv().is_err() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(parent) = cwd.parent() {
+                let _ = dotenvy::from_path(parent.join(".env"));
+            }
+        }
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

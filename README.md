@@ -8,7 +8,7 @@ A frameless desktop pet and AI assistant built with Tauri. Fetch floats transpar
 |---|---|
 | Frontend | React 19 + TypeScript + Vite |
 | Backend | Rust (Tauri v2) |
-| AI | OpenAI (gpt-4o) or Anthropic (Claude Sonnet 4.6) |
+| AI | OpenAI (gpt-5-nano) or Anthropic (Claude Sonnet 4.6) |
 | IPC | Tauri invoke commands |
 
 ## Architecture
@@ -31,7 +31,7 @@ A frameless desktop pet and AI assistant built with Tauri. Fetch floats transpar
 
 ## LLM Models
 
-- **OpenAI**: `gpt-4o` (set `OPENAI_API_KEY` in `.env`)
+- **OpenAI**: `gpt-5-nano` (set `OPENAI_API_KEY` in `.env`)
 - **Anthropic**: `claude-sonnet-4-6` (set `ANTHROPIC_API_KEY` in `.env`)
 
 If both keys are set, Anthropic takes priority.
