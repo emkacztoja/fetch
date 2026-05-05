@@ -2,55 +2,57 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-interface StatusMessage {
+interface Message {
+  role: "user" | "assistant" | "tool";
   text: string;
   id: number;
 }
 
+let msgId = 0;
+
 function App() {
   const [chatVisible, setChatVisible] = useState(false);
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState<StatusMessage | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const statusTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const nextStatusId = useRef(0);
+  const chatLogRef = useRef<HTMLDivElement>(null);
 
-  const showStatus = useCallback((text: string, duration = 3000) => {
-    if (statusTimeout.current) clearTimeout(statusTimeout.current);
-    const id = nextStatusId.current++;
-    setStatus({ text, id });
-    statusTimeout.current = setTimeout(() => {
-      setStatus((prev) => (prev?.id === id ? null : prev));
-    }, duration);
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => {
+      if (chatLogRef.current) {
+        chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
+      }
+    }, 50);
   }, []);
 
+  const addMessage = useCallback((role: Message["role"], text: string) => {
+    setMessages((prev) => [...prev, { role, text, id: ++msgId }]);
+    scrollToBottom();
+  }, [scrollToBottom]);
+
   const handleDoubleClick = useCallback(() => {
-    setChatVisible((v) => {
-      const next = !v;
-      if (next) {
-        setTimeout(() => inputRef.current?.focus(), 100);
-      }
-      return next;
-    });
+    setChatVisible((v) => !v);
   }, []);
 
   const handleSend = useCallback(async () => {
     const prompt = input.trim();
     if (!prompt || loading) return;
 
+    setChatVisible(true);
     setInput("");
     setLoading(true);
+    addMessage("user", prompt);
 
     try {
       const response = await invoke<string>("chat_with_pet", { prompt });
-      showStatus(response);
+      addMessage("assistant", response);
     } catch (err) {
-      showStatus(`Error: ${err}`, 5000);
+      addMessage("tool", `Error: ${err}`);
     } finally {
       setLoading(false);
     }
-  }, [input, loading, showStatus]);
+  }, [input, loading, addMessage]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -63,31 +65,45 @@ function App() {
     [handleSend],
   );
 
-  // Close chat on click outside
-  useEffect(() => {
-    if (!chatVisible) return;
-    const handler = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.closest(".chat-bar-wrapper") || target.closest(".pet-sprite")) return;
-      setChatVisible(false);
-    };
-    document.addEventListener("click", handler);
-    return () => document.removeEventListener("click", handler);
-  }, [chatVisible]);
-
-  // Cleanup timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (statusTimeout.current) clearTimeout(statusTimeout.current);
-    };
+  const handleClear = useCallback(async () => {
+    try {
+      await invoke("clear_conversation");
+      setMessages([]);
+    } catch {
+      setMessages([]);
+    }
   }, []);
+
+  // Focus input when chat opens
+  useEffect(() => {
+    if (chatVisible) {
+      setTimeout(() => inputRef.current?.focus(), 100);
+    }
+  }, [chatVisible]);
 
   return (
     <div className="pet-container" data-tauri-drag-region>
-      {/* Status message above pet */}
-      {status && <div className="status-message" key={status.id}>{status.text}</div>}
+      {/* Chat log panel */}
+      {chatVisible && messages.length > 0 && (
+        <div className="chat-log-panel" ref={chatLogRef}>
+          {messages.map((msg) => (
+            <div key={msg.id} className={`chat-bubble ${msg.role}`}>
+              <span className="bubble-label">
+                {msg.role === "user" ? "You" : msg.role === "tool" ? "Tool" : "Fetch"}
+              </span>
+              <p>{msg.text}</p>
+            </div>
+          ))}
+          {loading && (
+            <div className="chat-bubble assistant">
+              <span className="bubble-label">Fetch</span>
+              <p className="typing-indicator">...</p>
+            </div>
+          )}
+        </div>
+      )}
 
-      {/* Pet sprite - drag region for window movement */}
+      {/* Pet sprite */}
       <div
         className="pet-sprite"
         onDoubleClick={handleDoubleClick}
@@ -103,6 +119,11 @@ function App() {
 
       {/* Slide-out chat bar */}
       <div className={`chat-bar-wrapper${chatVisible ? " visible" : ""}`}>
+        {messages.length > 0 && (
+          <button className="clear-btn" onClick={handleClear} title="Clear conversation">
+            Clear
+          </button>
+        )}
         <div className="chat-bar">
           <input
             ref={inputRef}

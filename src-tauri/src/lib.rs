@@ -1,41 +1,91 @@
-
 use std::process::Command;
+use std::sync::Mutex;
+
+// ── Conversation state ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+struct ConversationHistory(Mutex<Vec<ChatMessage>>);
+
+impl ConversationHistory {
+    fn new() -> Self {
+        Self(Mutex::new(vec![ChatMessage {
+            role: "system".into(),
+            content: "You are Fetch, a helpful desktop AI assistant pet. You can use tools to help the user. Keep responses concise and friendly.".into(),
+        }]))
+    }
+}
+
+// ── Tauri commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn chat_with_pet(prompt: String) -> Result<String, String> {
-    if let Ok(key) = dotenvy::var("ANTHROPIC_API_KEY") {
+async fn chat_with_pet(
+    state: tauri::State<'_, ConversationHistory>,
+    prompt: String,
+) -> Result<String, String> {
+    // Add user message to history
+    {
+        let mut history = state.0.lock().unwrap();
+        history.push(ChatMessage { role: "user".into(), content: prompt });
+    }
+
+    // Build messages from history
+    let messages: Vec<ChatMessage> = state.0.lock().unwrap().clone();
+
+    let response = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         eprintln!("[fetch] Using Anthropic API");
-        chat_with_anthropic(&key, &prompt).await
-    } else if let Ok(key) = dotenvy::var("OPENAI_API_KEY") {
-        eprintln!("[fetch] Using OpenAI API");
-        chat_with_openai(&key, &prompt).await
+        chat_with_anthropic(&key, &messages).await
+    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        let masked = format!("{}...{} (len={})",
+            &key[..key.len().min(20)],
+            &key[key.len().saturating_sub(4)..],
+            key.len());
+        eprintln!("[fetch] Using OpenAI API | key: {masked}");
+        chat_with_openai(&key, &messages).await
     } else {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
         eprintln!("[fetch] No API key found. CWD: {cwd}");
         Err(format!("No API key found in {cwd}. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env"))
+    }?;
+
+    // Save assistant response to history
+    {
+        let mut history = state.0.lock().unwrap();
+        history.push(ChatMessage { role: "assistant".into(), content: response.clone() });
     }
+
+    Ok(response)
+}
+
+#[tauri::command]
+async fn clear_conversation(state: tauri::State<'_, ConversationHistory>) -> Result<(), String> {
+    let mut history = state.0.lock().unwrap();
+    history.truncate(1); // keep system prompt
+    eprintln!("[fetch] Conversation cleared");
+    Ok(())
 }
 
 // ── OpenAI path ──────────────────────────────────────────────────────────────
 
-async fn chat_with_openai(api_key: &str, prompt: &str) -> Result<String, String> {
+async fn chat_with_openai(api_key: &str, messages: &[ChatMessage]) -> Result<String, String> {
     let client = reqwest::Client::new();
+
+    let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
+        serde_json::json!({ "role": m.role, "content": m.content })
+    }).collect();
 
     let body = serde_json::json!({
         "model": "gpt-5.4-nano",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Fetch, a helpful desktop AI assistant pet. You can use tools to help the user. Keep responses concise and friendly."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
+        "messages": msgs,
         "tools": tools_schema(),
         "tool_choice": "auto"
     });
+
+    eprintln!("[fetch] Sending request to OpenAI ({} history msgs)...", messages.len());
 
     let resp = client
         .post("https://api.openai.com/v1/chat/completions")
@@ -44,31 +94,54 @@ async fn chat_with_openai(api_key: &str, prompt: &str) -> Result<String, String>
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {}", e))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("JSON parse error: {}", e))?;
+        .map_err(|e| {
+            eprintln!("[fetch] HTTP send error: {e}");
+            format!("HTTP error: {e}")
+        })?;
 
-    process_llm_response(resp).await
+    let status = resp.status();
+    eprintln!("[fetch] OpenAI response status: {status}");
+
+    let text = resp.text().await.map_err(|e| {
+        eprintln!("[fetch] Body read error: {e}");
+        format!("Read error: {e}")
+    })?;
+
+    eprintln!("[fetch] OpenAI response body (first 500 chars): {}", &text[..text.len().min(500)]);
+
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        eprintln!("[fetch] JSON parse error: {e}");
+        format!("JSON parse error: {e}")
+    })?;
+
+    process_llm_response(json).await
 }
 
 // ── Anthropic path ───────────────────────────────────────────────────────────
 
-async fn chat_with_anthropic(api_key: &str, prompt: &str) -> Result<String, String> {
+async fn chat_with_anthropic(api_key: &str, messages: &[ChatMessage]) -> Result<String, String> {
     let client = reqwest::Client::new();
 
-    let body = serde_json::json!({
+    // Separate system message from conversation messages
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let conversation: Vec<serde_json::Value> = messages.iter()
+        .filter(|m| m.role != "system")
+        .map(|m| {
+            serde_json::json!({ "role": m.role, "content": m.content })
+        }).collect();
+
+    let mut body = serde_json::json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
-        "system": "You are Fetch, a helpful desktop AI assistant pet. You can use tools to help the user. Keep responses concise and friendly.",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
+        "messages": conversation,
         "tools": anthropic_tools_schema()
     });
+
+    if let Some(sys) = system_msg {
+        body["system"] = serde_json::json!(sys.content);
+    }
+
+    eprintln!("[fetch] Sending request to Anthropic ({} history msgs)...", messages.len());
 
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
@@ -78,12 +151,27 @@ async fn chat_with_anthropic(api_key: &str, prompt: &str) -> Result<String, Stri
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {}", e))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("JSON parse error: {}", e))?;
+        .map_err(|e| {
+            eprintln!("[fetch] HTTP send error: {e}");
+            format!("HTTP error: {e}")
+        })?;
 
-    process_anthropic_response(resp).await
+    let status = resp.status();
+    eprintln!("[fetch] Anthropic response status: {status}");
+
+    let text = resp.text().await.map_err(|e| {
+        eprintln!("[fetch] Body read error: {e}");
+        format!("Read error: {e}")
+    })?;
+
+    eprintln!("[fetch] Anthropic response body (first 500 chars): {}", &text[..text.len().min(500)]);
+
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        eprintln!("[fetch] JSON parse error: {e}");
+        format!("JSON parse error: {e}")
+    })?;
+
+    process_anthropic_response(json).await
 }
 
 // ── Tool schemas ─────────────────────────────────────────────────────────────
@@ -186,7 +274,6 @@ fn anthropic_tools_schema() -> serde_json::Value {
 async fn process_llm_response(resp: serde_json::Value) -> Result<String, String> {
     let choice = &resp["choices"][0]["message"];
 
-    // Check for tool calls
     if let Some(tool_calls) = choice["tool_calls"].as_array() {
         if let Some(tc) = tool_calls.first() {
             let func_name = tc["function"]["name"].as_str().unwrap_or("");
@@ -198,7 +285,6 @@ async fn process_llm_response(resp: serde_json::Value) -> Result<String, String>
         }
     }
 
-    // Text response
     choice["content"]
         .as_str()
         .map(|s| s.to_string())
@@ -206,7 +292,6 @@ async fn process_llm_response(resp: serde_json::Value) -> Result<String, String>
 }
 
 async fn process_anthropic_response(resp: serde_json::Value) -> Result<String, String> {
-    // Anthropic returns an array of content blocks
     let content_blocks = resp["content"]
         .as_array()
         .ok_or_else(|| "No content blocks in response".to_string())?;
@@ -297,7 +382,6 @@ fn read_clipboard() -> Result<String, String> {
 }
 
 fn change_theme(theme: &str) {
-    // Set Windows registry theme preference via reg command
     let registry_value = match theme {
         "light" => "1",
         "dark" => "0",
@@ -333,22 +417,51 @@ fn change_theme(theme: &str) {
         .output();
 }
 
+fn find_env_file() -> Option<String> {
+    let candidates = vec![
+        std::env::current_dir().ok().map(|p| p.join(".env")),
+        std::env::current_dir().ok().and_then(|p| p.parent().map(|q| q.join(".env"))),
+        std::env::var("CARGO_MANIFEST_DIR").ok().and_then(|p| {
+            std::path::Path::new(&p).parent().map(|q| q.join(".env"))
+        }),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
 // ── App entry point ──────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load .env from multiple possible locations (Tauri dev may run from src-tauri/)
-    if dotenvy::dotenv().is_err() {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Some(parent) = cwd.parent() {
-                let _ = dotenvy::from_path(parent.join(".env"));
+    let env_file = find_env_file();
+    if let Some(path) = &env_file {
+        eprintln!("[fetch] Loading .env from {path}");
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    std::env::set_var(key, value);
+                }
             }
         }
+    } else {
+        eprintln!("[fetch] No .env file found");
     }
 
     tauri::Builder::default()
+        .manage(ConversationHistory::new())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![chat_with_pet])
+        .invoke_handler(tauri::generate_handler![chat_with_pet, clear_conversation])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
